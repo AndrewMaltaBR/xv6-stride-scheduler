@@ -50,11 +50,14 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
   int tickets;                 // Tickets of process
-  int schedCount;              // Times it was sched
+  int stride;                  // Stride of process
+  int pass;                    // Pass of process
+  int count;                   // Times it was scheduled
 };
 
 #define MIN_TICKETS 10
 #define MAX_TICKETS 50
+#define STRIDE1 10000
 
 // Process memory is laid out contiguously, low addresses first:
 //   text

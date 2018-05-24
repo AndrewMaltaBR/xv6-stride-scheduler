@@ -8,6 +8,93 @@
 #include "spinlock.h"
 #include "rand.c"
 
+// This section implements min heap of pass and index of runnable process
+
+#define LCHILD(x) 2 * x + 1
+#define RCHILD(x) 2 * x + 2
+#define PARENT(x) (x - 1) / 2
+
+typedef struct node {
+  int pass;
+  int index;
+} node;
+
+typedef struct minHeap {
+  int size;
+  node elem[NPROC];
+} minHeap;
+
+minHeap hp;
+
+// Showing min heap like a array
+void showMinHeap(void){
+  int i;
+  cprintf("\nMin Heap...: ");
+  for(i = 0; i < hp.size; i++){
+    if(i > 0)
+      cprintf(", ");
+    cprintf("(%d,%d)", hp.elem[i].pass, hp.elem[i].index);
+  }
+}
+
+// Swap node values
+void swap(node *n1, node *n2) {
+  node temp = *n1;
+  *n1 = *n2;
+  *n2 = temp;
+}
+
+// Verify and reorganize the min heap
+void heapify(int i) {
+  int smallest = (LCHILD(i) < hp.size && hp.elem[LCHILD(i)].pass < hp.elem[i].pass) ? LCHILD(i) : i;
+  if(RCHILD(i) < hp.size && hp.elem[RCHILD(i)].pass < hp.elem[smallest].pass) {
+    smallest = RCHILD(i);
+  }
+  if(smallest != i) {
+    swap(&(hp.elem[i]), &(hp.elem[smallest])) ;
+    heapify(smallest);
+  }
+}
+
+// Insert a node passing pass and index of process
+void insertNode(int pass, int index) {
+  node nd;
+  nd.pass = pass;
+  nd.index = index;
+
+  int i = (hp.size)++;
+  while(i && nd.pass < hp.elem[PARENT(i)].pass) {
+    hp.elem[i] = hp.elem[PARENT(i)];
+    i = PARENT(i);
+  }
+  hp.elem[i] = nd;
+
+  //showMinHeap();
+}
+
+// Delete min pass node
+void deleteNode(node *nd) {
+  if(hp.size) {
+    *nd = hp.elem[0];
+    hp.elem[0] = hp.elem[--(hp.size)] ;
+    heapify(0);
+  }
+}
+
+// Set all scheduler values of process
+void setPass(struct proc *p, int tickets){
+  if(tickets < MIN_TICKETS)
+    tickets = MIN_TICKETS;
+  else if(tickets > MAX_TICKETS)
+    tickets = MAX_TICKETS;
+  p->tickets = tickets;
+  p->stride = STRIDE1/tickets;
+  p->pass = p->stride;
+  p->count = 0;
+}
+
+// Proc.c init
+
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
@@ -24,6 +111,7 @@ static void wakeup1(void *chan);
 void
 pinit(void)
 {
+  hp.size = 0;
   initlock(&ptable.lock, "ptable");
 }
 
@@ -118,6 +206,15 @@ found:
 
 //PAGEBREAK: 32
 // Set up first user process.
+void setRunnable(struct proc *np){
+  struct proc *p;
+  int i = 0;
+  np->state =  RUNNABLE;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++, i++)
+    if(np == p) break;
+  insertNode(np->pass, i);
+}
+
 void
 userinit(void)
 {
@@ -139,8 +236,8 @@ userinit(void)
   p->tf->eflags = FL_IF;
   p->tf->esp = PGSIZE;
   p->tf->eip = 0;  // beginning of initcode.S
-  p->tickets = MAX_TICKETS; // Setting max of tickets
-  p->schedCount = 0; // Initial value
+
+  setPass(p, MAX_TICKETS);
 
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
@@ -151,7 +248,7 @@ userinit(void)
   // because the assignment might not be atomic.
   acquire(&ptable.lock);
 
-  p->state = RUNNABLE;
+  setRunnable(p);
 
   release(&ptable.lock);
 }
@@ -202,13 +299,8 @@ fork(int tickets)
   np->sz = curproc->sz;
   np->parent = curproc;
   *np->tf = *curproc->tf;
-  np->schedCount = 0; // Initial value
 
-  if(tickets < MIN_TICKETS)
-  	tickets = MIN_TICKETS;
-  else if(tickets > MAX_TICKETS)
-    tickets = MAX_TICKETS;
-  np->tickets = tickets;
+  setPass(np, tickets);
 
   // Clear %eax so that fork returns 0 in the child.
   np->tf->eax = 0;
@@ -223,11 +315,11 @@ fork(int tickets)
   pid = np->pid;
   acquire(&ptable.lock);
 
-  np->state = RUNNABLE;
+  setRunnable(np);
 
   release(&ptable.lock);
 
-  cprintf("New process - Pid: %d Tickets: %d\n", np->pid, np->tickets);
+  cprintf("\nNew process: Pid: %d Pass: %d", np->pid, np->pass);
   return pid;
 }
 
@@ -329,54 +421,45 @@ wait(void)
 //  - swtch to start running that process
 //  - eventually that process transfers control
 //      via swtch back to the scheduler.
-int totalTickets(void){
-  struct proc *p;
-  int total = 0;
-
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == RUNNABLE)
-      total += p->tickets;
-  return total;
-}
-
 void scheduler(void){
   struct proc *p;
   struct cpu *c = mycpu();
-  int chosen=1, total, times=0;
   
-  for(;;times++){
+  for(;;){
     // Enable interrupts on this processor.
     sti();
     acquire(&ptable.lock);
-    total = totalTickets(); // Get total of tickets
-    if(total > 0){
-      srand(ticks*times);
-      chosen = rand() % total;
-      int sum = 0; // Accumulated tickets
-      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-        // Calculing Accumulated tickets
-        if(p->state == RUNNABLE)
-          sum += p->tickets;
-        if(p->state != RUNNABLE || sum < chosen)
-          continue;
+    
+    // Getting the index of process with the min pass
+    node nd;
+    nd.index = -1;
+    deleteNode(&nd);
 
-        // Switch to chosen process.  It is the process's job
-        // to release ptable.lock and then reacquire it
-        // before jumping back to us.
-        c->proc = p;
-        switchuvm(p);
-        p->state = RUNNING;
-        p->schedCount++;
-
-        swtch(&(c->scheduler), p->context);
-        switchkvm();
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        break;
-      }
+    // Validating index
+    if(nd.index >= 0)
+      p = &(ptable.proc[nd.index]);
+    else{
+      release(&ptable.lock);
+      continue;
     }
+    cprintf("\nRunning....: Pid: %d Index: %d Pass: %d", p->pid, nd.index, p->pass);
+
+    // Switch to chosen process.  It is the process's job
+    // to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    c->proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+    p->pass += p->stride;
+    p->count++;
+
+    swtch(&(c->scheduler), p->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+
     release(&ptable.lock);
   }
 }
@@ -412,7 +495,7 @@ void
 yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
-  myproc()->state = RUNNABLE;
+  setRunnable(myproc());
   sched();
   release(&ptable.lock);
 }
@@ -487,7 +570,7 @@ wakeup1(void *chan)
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
     if(p->state == SLEEPING && p->chan == chan)
-      p->state = RUNNABLE;
+      setRunnable(p);
 }
 
 // Wake up all processes sleeping on chan.
@@ -513,7 +596,7 @@ kill(int pid)
       p->killed = 1;
       // Wake process from sleep if necessary.
       if(p->state == SLEEPING)
-        p->state = RUNNABLE;
+        setRunnable(p);
       release(&ptable.lock);
       return 0;
     }
@@ -540,6 +623,8 @@ void procdump(void){
   char *state;
   uint pc[10];
 
+  showMinHeap();
+  cprintf("\n");
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->state == UNUSED)
       continue;
@@ -547,7 +632,7 @@ void procdump(void){
       state = states[p->state];
     else
       state = "???";
-    cprintf("%d %s %s %d %d", p->pid, state, p->name, p->tickets, p->schedCount);
+    cprintf("%d %s %s Tickets: %d Stride: %d Count: %d", p->pid, state, p->name, p->tickets, p->stride, p->count);
     if(p->state == SLEEPING){
       getcallerpcs((uint*)p->context->ebp+2, pc);
       for(i=0; i<10 && pc[i] != 0; i++)
