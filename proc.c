@@ -6,7 +6,6 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
-#include "rand.c"
 
 // This section implements min heap of pass and index of runnable process
 
